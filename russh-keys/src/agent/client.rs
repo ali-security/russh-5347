@@ -270,9 +270,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AgentClient<S> {
                     }
                 }
             }
+            Ok(keys)
+        } else if self.buf[0] == msg::FAILURE {
+            Err(Error::AgentFailure)
+        } else {
+            Err(Error::AgentProtocolError)
         }
-
-        Ok(keys)
     }
 
     /// Ask the agent to sign the supplied piece of data.
@@ -307,7 +310,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AgentClient<S> {
                 (self, Err(Error::AgentFailure))
             } else {
                 debug!("self.buf = {:?}", &self.buf[..]);
-                (self, Ok(data))
+                (self, Err(Error::AgentProtocolError))
             }
         }
     }
@@ -369,8 +372,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AgentClient<S> {
             if !self.buf.is_empty() && self.buf[0] == msg::SIGN_RESPONSE {
                 let base64 = data_encoding::BASE64_NOPAD.encode(&self.buf[1..]);
                 (self, Ok(base64))
+            } else if self.buf.first() == Some(&msg::FAILURE) {
+                (self, Err(Error::AgentFailure))
             } else {
-                (self, Ok(String::new()))
+                (self, Err(Error::AgentProtocolError))
             }
         }
     }
@@ -526,4 +531,88 @@ fn key_blob(public: &key::PublicKey, buf: &mut CryptoVec) -> Result<(), Error> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{duplex, DuplexStream};
+
+    // Helper to create a mock agent that sends invalid responses
+    async fn mock_agent_invalid_response(mut server: DuplexStream) {
+        use tokio::io::AsyncWriteExt;
+
+        // Read the request (we don't care about parsing it)
+        let mut len_buf = [0u8; 4];
+        if server.read_exact(&mut len_buf).await.is_err() {
+            return;
+        }
+        let len = BigEndian::read_u32(&len_buf) as usize;
+        let mut req = vec![0u8; len];
+        if server.read_exact(&mut req).await.is_err() {
+            return;
+        }
+
+        // Send SUCCESS message (invalid for both request_identities and sign_request)
+        let response = [msg::SUCCESS];
+        let mut msg_with_len = vec![0u8; 4];
+        BigEndian::write_u32(&mut msg_with_len, response.len() as u32);
+        msg_with_len.extend_from_slice(&response);
+
+        let _ = server.write_all(&msg_with_len).await;
+        let _ = server.flush().await;
+
+        // Send another SUCCESS for the second request
+        let _ = server.read_exact(&mut len_buf).await;
+        if let Ok(len) = BigEndian::read_u32(&len_buf).try_into() {
+            let mut req = vec![0u8; len];
+            let _ = server.read_exact(&mut req).await;
+        }
+        let _ = server.write_all(&msg_with_len).await;
+        let _ = server.flush().await;
+    }
+
+    #[tokio::test]
+    async fn test_invalid_responses() {
+        // Create a duplex stream (bidirectional pipe)
+        let (client_stream, server_stream) = duplex(1024);
+
+        // Spawn the mock agent
+        tokio::spawn(async move {
+            mock_agent_invalid_response(server_stream).await;
+        });
+
+        let mut agent = AgentClient::connect(client_stream);
+
+        // Test request_identities with invalid response
+        let result = agent.request_identities().await;
+        assert!(result.is_err(), "Expected error for invalid response");
+        if let Err(e) = result {
+            assert!(
+                matches!(e, Error::AgentProtocolError),
+                "Expected AgentProtocolError, got: {:?}",
+                e
+            );
+        }
+
+        // Test sign_request with invalid response
+        // Create a dummy Ed25519 key for testing
+        let secret = ed25519_dalek::SecretKey::from_bytes(&[42u8; 32]).unwrap();
+        let public = ed25519_dalek::PublicKey::from(&secret);
+        let public_key = PublicKey::Ed25519(public);
+
+        let data = CryptoVec::from(b"test data".as_ref());
+        let (agent, result) = agent.sign_request(&public_key, data).await;
+        assert!(result.is_err(), "Expected error for invalid sign response");
+        if let Err(e) = result {
+            assert!(
+                matches!(e, Error::AgentProtocolError),
+                "Expected AgentProtocolError, got: {:?}",
+                e
+            );
+        }
+
+        // Clean up
+        drop(agent);
+    }
 }
